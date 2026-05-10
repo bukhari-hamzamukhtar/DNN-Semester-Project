@@ -197,14 +197,3 @@ Full architectural upgrade. Replaces the stateless attention module with a GRU-b
 - **GRU resets on missile count change:** When a missile is destroyed, the GRU hidden state resets for all remaining missiles, losing accumulated trajectory memory at the moment it is most critical.
 
 ---
-
-## Citation
-
-```bibtex
-@inproceedings{bukhari2025neuralevasion,
-  title     = {Real-Time Adversarial Evasion via Graph Neural Networks with Temporal Threat Attention and Curriculum Learning},
-  author    = {Bukhari, Syed Hamza Mukhtar},
-  year      = {2025},
-  institution = {GIK Institute of Engineering Sciences and Technology}
-}
-```
