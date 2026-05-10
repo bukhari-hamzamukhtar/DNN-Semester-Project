@@ -54,11 +54,11 @@ python main3.py
 | Key | Action |
 |-----|--------|
 | `H` | Fire homing missile (tracks the jet) |
-| `B` | Fire ballistic missile (fires at jet's current position — time your shot) |
+| `B` | Fire ballistic missile (fires at jet's current position) |
 | `C` | Fire cluster swarm — 5 micro-missiles in a V-spread (6 s cooldown) |
 | `ESC` | Return to menu |
 
-**Objective:** Take down the AI jet before the 15-second timer expires. If it survives, it counter-strikes your launchers.
+**Objective:** Take down the AI jet before it obliterate the base.
 
 > The game runs without `jet_brain_v3.pt` — it will warn and use random weights, which still demonstrates the threading and FSM systems.
 
@@ -112,7 +112,7 @@ The notebook:
 
 Download `jet_brain_v3.pt` and place it next to `main3.py`.
 
-> **Expected training time:** ~45–60 minutes for all five stages on a Colab T4 GPU. Each stage processes between 40k–95k graph records. A `.pt` cache file is written after each stage so interrupted sessions can resume without rebuilding graphs.
+> **Expected training time:** ~140–170 minutes for all five stages on a Colab T4 GPU. Each stage processes between 40k–95k graph records. A `.pt` cache file is written after each stage so interrupted sessions can resume without rebuilding graphs.
 
 ---
 
@@ -204,7 +204,6 @@ Full architectural upgrade. Replaces the stateless attention module with a GRU-b
 @inproceedings{bukhari2025neuralevasion,
   title     = {Real-Time Adversarial Evasion via Graph Neural Networks with Temporal Threat Attention and Curriculum Learning},
   author    = {Bukhari, Syed Hamza Mukhtar},
-  booktitle = {Proceedings of the IEEE Conference},
   year      = {2025},
   institution = {GIK Institute of Engineering Sciences and Technology}
 }
