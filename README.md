@@ -41,7 +41,7 @@ neural-evasion/
 # 1. Install dependencies (read requirements.txt for PyG installation order)
 pip install pygame torch torch_geometric numpy
 
-# 2. Download trained weights  (jet_brain_v3.pt) from the v3.0 release assets
+# 2. Download trained weights  (jet_brain_v3.pt) from the notebook, after feeding .jsonl files to it - generated from headless_sim3.py.
 #    and place in the same directory as main3.py
 
 # 3. Run
