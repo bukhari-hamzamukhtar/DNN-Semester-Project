@@ -4,7 +4,7 @@
 
 An AI-controlled jet continuously evades a user-fired multi-missile barrage using a 198,872-parameter Graph Neural Network. The model encodes every active missile as an isolated interaction sub-graph, routes per-missile embeddings through a GRU-based cross-threat attention module that preserves trajectory memory across frames, and outputs both a collision danger score and a six-class tactical maneuver recommendation — all in ~4 ms on an Intel Core i5.
 
-> **Published paper:** *Real-Time Adversarial Evasion via Graph Neural Networks with Temporal Threat Attention and Curriculum Learning* See [`paper/report.pdf`](paper/report.pdf).
+> **Report:** *Real-Time Adversarial Evasion via Graph Neural Networks with Temporal Threat Attention and Curriculum Learning* See [`paper/report.pdf`](paper/report.pdf).
 
 ---
 
