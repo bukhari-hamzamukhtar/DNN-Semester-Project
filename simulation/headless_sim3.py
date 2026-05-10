@@ -3,16 +3,26 @@ import random
 import json
 import time
 
-NUM_SIMULATIONS = 8000
-FRAMES_PER_SIM = 300
-LOG_INTERVAL = 5
+CURRICULUM_STAGES = [
+    {"name": "slow_singles",  "num_m": (1, 2), "speed": (2.0, 4.0), "hot_prob": 0.05, "turn_rate": 0.06},
+    {"name": "fast_homing",   "num_m": (1, 3), "speed": (4.0, 6.0), "hot_prob": 0.15, "turn_rate": 0.10},
+    {"name": "multi_threat",  "num_m": (2, 4), "speed": (4.5, 7.0), "hot_prob": 0.25, "turn_rate": 0.12},
+    {"name": "cluster_swarm", "num_m": (3, 6), "speed": (5.0, 8.0), "hot_prob": 0.40, "turn_rate": 0.15},
+    {"name": "adversarial",   "num_m": (4, 8), "speed": (5.5, 9.0), "hot_prob": 0.60, "turn_rate": 0.18},
+]
+NUM_SIMULATIONS  = 2000   # per stage
+FRAMES_PER_SIM   = 300
+LOG_INTERVAL     = 5
+WIDTH, HEIGHT    = 800, 600
 LOOKAHEAD_FRAMES = 60  # 1 full second of lookahead
 
-WIDTH, HEIGHT = 800, 600
 JET_RADIUS = 11
 MISSILE_RADIUS = 3
 FLARE_RADIUS = 6
 HIT_DISTANCE = JET_RADIUS + MISSILE_RADIUS
+
+MANEUVER_NAMES = ["NORMAL", "BARREL_ROLL", "JINKING", "FALLING_LEAF", "COBRA", "IMMELMANN"]
+MANEUVER_IDX   = {name: i for i, name in enumerate(MANEUVER_NAMES)}
 
 def normalize_angle(angle):
     return (angle + math.pi) % (2 * math.pi) - math.pi
@@ -20,7 +30,30 @@ def normalize_angle(angle):
 def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
-def generate_headless_data():
+def oracle_maneuver(jet_pos, missiles, arena_w=800, arena_h=600, margin=45):
+    if not missiles:
+        return "NORMAL"
+    jx, jy = jet_pos
+    near = [(m, math.hypot(m["pos"][0]-jx, m["pos"][1]-jy)) for m in missiles]
+    if min(jx, arena_w-jx, jy, arena_h-jy) < margin:
+        return "IMMELMANN"
+    close_80  = [m for m,d in near if d < 80]
+    close_150 = [m for m,d in near if d < 150]
+    close_200 = [m for m,d in near if d < 200]
+    if len(close_80) == 1:
+        m = close_80[0]
+        dx, dy = m["pos"][0]-jx, m["pos"][1]-jy
+        if m["vel"][0]*dx + m["vel"][1]*dy < 0:
+            return "COBRA"
+    if len(close_150) >= 2:
+        return "FALLING_LEAF"
+    if len(missiles) >= 3 and len(close_200) >= 1:
+        return "JINKING"
+    if len(close_200) == 1 and len(missiles) == 1 and min(jx, arena_w-jx) > 160 and min(jy, arena_h-jy) > 160:
+        return "BARREL_ROLL"
+    return "NORMAL"
+
+def generate_headless_data(stage_cfg, output_file="data.jsonl"):
     print(f"Spinning up {NUM_SIMULATIONS} headless rounds...")
     start_time = time.time()
     dataset = []
@@ -39,11 +72,10 @@ def generate_headless_data():
             "drag": 0.92
         }
 
-        # MISSILES: 30% of sims are "hot" scenarios with close spawns
-        num_missiles = random.randint(1, 5)
-        missiles = []
-        is_hot_scenario = (random.random() < 0.30)
-
+        # --- MISSILES: 30% of sims are "hot" scenarios with close spawns ---
+        num_missiles = random.randint(*stage_cfg["num_m"])
+        is_hot_scenario = (random.random() < stage_cfg["hot_prob"])
+        missiles = []  
         for _ in range(num_missiles):
             # Strongly prefer homing (75%) — ballistic almost never hits
             m_type = 0 if random.random() < 0.75 else 1
@@ -70,7 +102,8 @@ def generate_headless_data():
                 "vx": 0.0, "vy": 0.0,
                 "heading": math.atan2(jet["y"] - my, jet["x"] - mx),
                 # Hot scenarios: faster missiles
-                "speed": random.uniform(5.0, 8.0) if is_hot_scenario else random.uniform(3.5, 7.0),
+                "speed": random.uniform(*stage_cfg["speed"]),
+                "turn_rate": stage_cfg["turn_rate"],  # NEW — used in homing update
                 "type": m_type,
                 "dead": False
             })
@@ -81,8 +114,16 @@ def generate_headless_data():
         collision_history = []
 
         for frame in range(FRAMES_PER_SIM):
-            # JET UPDATE with wall bounce (keeps it in the arena)
-            jet["heading"] += random.uniform(-0.1, 0.1)
+            # --- JET UPDATE: 50% random, 50% flee-closest-missile ---
+            alive_missiles = [m for m in missiles if not m["dead"]]
+            if alive_missiles and random.random() < 0.50:
+                # Simple flee: steer away from closest missile
+                closest = min(alive_missiles, key=lambda m: math.hypot(m["x"]-jet["x"], m["y"]-jet["y"]))
+                flee_angle = math.atan2(jet["y"]-closest["y"], jet["x"]-closest["x"])
+                diff = normalize_angle(flee_angle - jet["heading"])
+                jet["heading"] += clamp(diff, -0.18, 0.18)
+            else:
+                jet["heading"] += random.uniform(-0.1, 0.1)
             thrust_x = math.cos(jet["heading"]) * jet["speed"]
             thrust_y = math.sin(jet["heading"]) * jet["speed"]
             jet["vx"] = jet["vx"] * jet["drag"] + thrust_x * 0.1
@@ -146,7 +187,7 @@ def generate_headless_data():
                     desired = math.atan2(dy, dx)
                     diff = normalize_angle(desired - m["heading"])
                     # 0.15 instead of 0.05 — actually dangerous now
-                    m["heading"] += max(-0.15, min(0.15, diff))
+                    m["heading"] += max(-m["turn_rate"], min(m["turn_rate"], diff))  # was hardcoded 0.15
 
                 m["vx"] = math.cos(m["heading"]) * m["speed"]
                 m["vy"] = math.sin(m["heading"]) * m["speed"]
@@ -198,6 +239,9 @@ def generate_headless_data():
             future_hit = any(collision_history[t: t + LOOKAHEAD_FRAMES])
             record = frame_history[t]
             record["label"] = 1 if future_hit else 0
+            record["maneuver"] = MANEUVER_IDX[oracle_maneuver(
+                record["jet"]["pos"], record["missiles"]
+            )]
             if len(record["missiles"]) > 0:
                 dataset.append(record)
 
@@ -209,10 +253,12 @@ def generate_headless_data():
     print(f"Label 1 (danger): {label_1} ({100*label_1/len(dataset):.1f}%)")
     print(f"Effective pos_weight: {label_0/max(label_1,1):.2f}x")
 
-    with open("data.jsonl", "w") as f:
+    with open(output_file, "w") as f:
         for entry in dataset:
             f.write(json.dumps(entry) + "\n")
-    print("Exported to data.jsonl")
+    print(f"Exported to {output_file}")
 
 if __name__ == "__main__":
-    generate_headless_data()
+    for stage in CURRICULUM_STAGES:
+        print(f"\n=== {stage['name']} ===")
+        generate_headless_data(stage, output_file=f"data_{stage['name']}.jsonl")

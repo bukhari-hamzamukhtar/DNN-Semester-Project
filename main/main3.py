@@ -10,6 +10,7 @@ from torch_geometric.utils import scatter
 import threading
 import queue
 
+
 # ═══════════════════════════════════════════════════════════════
 #  1.  GNN ARCHITECTURE
 # ═══════════════════════════════════════════════════════════════
@@ -58,39 +59,64 @@ class ThreatGNN(nn.Module):
         pooled = scatter(x, batch, dim=0, reduce='mean')
         return self.pool_head(pooled)
 
-class CrossThreatAttention(nn.Module):
-    def __init__(self):
+MANEUVER_NAMES = ["NORMAL", "BARREL_ROLL", "JINKING", "FALLING_LEAF", "COBRA", "IMMELMANN"]
+
+class TemporalThreatAttention(nn.Module):
+    def __init__(self, embed_dim=32, context_dim=5, hidden_dim=64):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.gru = nn.GRUCell(embed_dim + context_dim, hidden_dim)
         self.attn_scorer = nn.Sequential(
-            nn.Linear(34, 32), nn.ReLU(), nn.LayerNorm(32), nn.Linear(32, 1)
+            nn.Linear(hidden_dim, 32), nn.ReLU(), nn.LayerNorm(32), nn.Linear(32, 1)
         )
         self.danger_head = nn.Sequential(
-            nn.Linear(32, 16), nn.ReLU(), nn.LayerNorm(16), nn.Linear(16, 1), nn.Sigmoid()
+            nn.Linear(hidden_dim, 16), nn.ReLU(), nn.LayerNorm(16),
+            nn.Linear(16, 1), nn.Sigmoid()
         )
 
-    def forward(self, threat_embeds, contexts):
+    def forward(self, threat_embeds, contexts, hidden=None):
         if threat_embeds.size(0) == 0:
-            return torch.tensor([0.0], device=threat_embeds.device), torch.empty(0, device=threat_embeds.device)
-        combined = torch.cat([threat_embeds, contexts], dim=-1)
-        scores = self.attn_scorer(combined)
-        attn_weights = torch.softmax(scores / 1.5, dim=0)
-        z = torch.sum(attn_weights * threat_embeds, dim=0, keepdim=True)
+            dev = threat_embeds.device
+            return torch.tensor([0.0], device=dev), torch.empty(0, device=dev), None
+        K = threat_embeds.size(0)
+        if hidden is None or hidden.size(0) != K:
+            hidden = torch.zeros(K, self.hidden_dim, device=threat_embeds.device)
+        combined    = torch.cat([threat_embeds, contexts], dim=-1)
+        new_hidden  = self.gru(combined, hidden)
+        scores      = self.attn_scorer(new_hidden)
+        attn_weights = torch.softmax(scores / 0.5, dim=0)
+        z      = torch.sum(attn_weights * new_hidden, dim=0, keepdim=True)
         danger = self.danger_head(z).squeeze(-1)
-        return danger, attn_weights.squeeze(-1)
+        return danger, attn_weights.squeeze(-1), new_hidden
 
 class NeuralEvasionBrain(nn.Module):
     def __init__(self):
         super().__init__()
         self.threat_gnn = ThreatGNN()
-        self.attention = CrossThreatAttention()
+        self.attention  = TemporalThreatAttention()
+        # Maneuver head: 64 (GRU hidden pooled) + 1 (danger) → 6 logits
+        self.maneuver_head = nn.Sequential(
+            nn.Linear(65, 32), nn.ReLU(), nn.LayerNorm(32),
+            nn.Linear(32, 16), nn.ReLU(),
+            nn.Linear(16, len(MANEUVER_NAMES))
+        )
 
-    def forward(self, sub_graphs_list, contexts):
+    def forward(self, sub_graphs_list, contexts, hidden=None):
         if not sub_graphs_list:
             dev = contexts.device if contexts is not None else torch.device('cpu')
-            return torch.tensor([0.0], device=dev), torch.empty(0, device=dev)
+            return (torch.tensor([0.0], device=dev),
+                    torch.empty(0, device=dev),
+                    None,
+                    torch.zeros(len(MANEUVER_NAMES), device=dev))
         batched = Batch.from_data_list(sub_graphs_list)
-        embeds = self.threat_gnn(batched)
-        return self.attention(embeds, contexts)
+        embeds  = self.threat_gnn(batched)
+        danger, attn_weights, new_hidden = self.attention(embeds, contexts, hidden)
+        # Pool GRU hidden states for maneuver head
+        pooled      = new_hidden.mean(dim=0, keepdim=True)       # [1, 64]
+        m_input     = torch.cat([pooled, danger.unsqueeze(-1).unsqueeze(0)
+                                 if danger.dim()==0 else danger.unsqueeze(-1).reshape(1,1)], dim=-1)  # [1, 65]
+        maneuver_logits = self.maneuver_head(m_input).squeeze(0) # [6]
+        return danger, attn_weights, new_hidden, maneuver_logits
 
 # ═══════════════════════════════════════════════════════════════
 #  2.  LOAD MODEL
@@ -98,11 +124,24 @@ class NeuralEvasionBrain(nn.Module):
 print("Loading Neural Engine...")
 device = torch.device('cpu')
 model = NeuralEvasionBrain().to(device)
+
 try:
-    model.load_state_dict(torch.load('jet_brain_v2.pt', map_location=device), strict=False)
-    print("Engine Online. Weights loaded.")
+    # 1. Load the raw dictionary from the file
+    checkpoint = torch.load('jet_brain_v3.pt', map_location=device)
+    model_dict = model.state_dict()
+
+    # 2. Filter out anything that doesn't have the exact same shape
+    filtered_dict = {k: v for k, v in checkpoint.items() 
+                     if k in model_dict and v.shape == model_dict[k].shape}
+
+    # 3. Update the model's dictionary and load it safely
+    model_dict.update(filtered_dict)
+    model.load_state_dict(model_dict)
+    print("Engine Online. Weights loaded (Mismatched shapes skipped!).")
+    
 except FileNotFoundError:
-    print("WARNING: jet_brain_v2.pt not found — running with random weights.")
+    print("WARNING: jet_brain_v3.pt not found — running with random weights.")
+    
 model.eval()
 
 # ═══════════════════════════════════════════════════════════════
@@ -138,15 +177,28 @@ def build_candidate_sub_graphs(jet_sim, missiles_sim, flares_sim):
         edge_attr  = torch.stack(ea, dim=0).float()
         dist = math.hypot(jet_sim['pos'][0]-m['pos'][0], jet_sim['pos'][1]-m['pos'][1])
         nd   = min(dist/800.0, 1.0)
-        rvx  = m['vel'][0]-jet_sim['vel'][0]
-        rvy  = m['vel'][1]-jet_sim['vel'][1]
-        cs   = max(((jet_sim['pos'][0]-m['pos'][0])*rvx+(jet_sim['pos'][1]-m['pos'][1])*rvy)/(dist+1e-5), 0.1)
-        tti  = min((dist/cs)/5.0, 1.0)
-        ctx  = torch.tensor([nd, tti], dtype=torch.float)
+        # Signed closing speed
+        dx   = jet_sim['pos'][0] - m['pos'][0]
+        dy   = jet_sim['pos'][1] - m['pos'][1]
+        rvx  = m['vel'][0] - jet_sim['vel'][0]
+        rvy  = m['vel'][1] - jet_sim['vel'][1]
+        closing = (dx*rvx + dy*rvy) / (dist + 1e-5)
+        closing_norm = max(-1.0, min(1.0, closing / 10.0))
+        if closing > 0.05:
+            tti  = min((dist / closing) / 60.0, 1.0)
+        else:
+            tti  = 1.0
+        # Angle of attack
+        mh_len = math.hypot(rvx, rvy) + 1e-5
+        aoa    = max(0.0, (dx*rvx + dy*rvy) / ((dist+1e-5) * mh_len))
+        mtype  = float(m.get('type', 1))
+        ctx  = torch.tensor([nd, tti, closing_norm, aoa, mtype], dtype=torch.float)
         sub_graphs.append(Data(x=x, edge_index=edge_index, edge_attr=edge_attr, context=ctx))
     return sub_graphs
 
 def gnn_inference_worker():
+    gru_hidden         = None   # persists missile trajectory memory across frames
+    prev_missile_count = 0      # used to detect when to reset hidden state
     while True:
         state = state_queue.get()
         if state is None:
@@ -155,7 +207,10 @@ def gnn_inference_worker():
         best_heading  = state['jet']['heading']
         lowest_total  = 999.0
         best_attention = []
-        candidates = [0, 0.26, -0.26, 0.52, -0.52, 0.8, -0.8, 1.2, -1.2]
+        candidates = [0, 0.20, -0.20, 0.40, -0.40, 0.65, -0.65, 1.0, -1.0, 1.4, -1.4, math.pi]
+        candidate_scores = []
+        best_edges = []
+        current_situation_danger = 0.0 
         for delta in candidates:
             th    = state['jet']['heading'] + delta
             tvx   = math.cos(th) * 4.0
@@ -173,7 +228,7 @@ def gnn_inference_worker():
                     sgs  = build_candidate_sub_graphs(js, ms, fs)
                     ctxs = torch.stack([g.context for g in sgs]).to(device)
                     with torch.no_grad():
-                        dnn_danger, aw = model(sgs, ctxs)
+                        dnn_danger, aw, _, _ = model(sgs, ctxs, gru_hidden)
                     gnn_d        = dnn_danger.item()
                     current_attn = aw.cpu().numpy().tolist()
                 else:
@@ -186,13 +241,66 @@ def gnn_inference_worker():
                     esc += -0.04 if pd > cd else 0.04
                 cp = (math.hypot(px-400, py-275)/800.0)*0.10
                 total_danger = gnn_d + esc + cp
+                if delta == 0:  # current heading
+                    current_situation_danger = total_danger
+
+                if ms and total_danger < lowest_total:
+                    with torch.no_grad():
+                        batched = Batch.from_data_list(sgs)
+                        x = model.threat_gnn.node_enc(batched.x)
+                        ea = model.threat_gnn.edge_enc(batched.edge_attr)
+                        for layer in model.threat_gnn.layers:
+                            x, ea, _ = layer(x, batched.edge_index, ea, None, batched.batch)
+                        magnitudes = ea.norm(dim=1).cpu().numpy()
+
+                    edge_data = []
+                    for k, sg in enumerate(sgs):
+                        nodes_pos = [
+                            [js['pos'][0], js['pos'][1]],
+                            [ms[k]['pos'][0], ms[k]['pos'][1]]
+                        ] + [[f['pos'][0], f['pos'][1]] for f in fs[:6]]
+                        for idx, (i, j) in enumerate(sg.edge_index.t().tolist()):
+                            if i < len(nodes_pos) and j < len(nodes_pos):
+                                edge_data.append({
+                                    'p1': nodes_pos[i],
+                                    'p2': nodes_pos[j],
+                                    'mag': float(magnitudes[idx]) if idx < len(magnitudes) else 0.0
+                                })
+                    best_edges = edge_data
+
+            candidate_scores.append((th, total_danger))
             if total_danger < lowest_total:
                 lowest_total  = total_danger
                 best_heading  = th
                 best_attention = current_attn
-        drop_flare = lowest_total > 0.42
+
+        # Only drop flare when genuinely hot AND missiles are present
+        # ── REAL FORWARD PASS: updates GRU memory + gets maneuver recommendation ──
+        ms_count = len(state['missiles'])
+        if ms_count != prev_missile_count:
+            gru_hidden = None
+        prev_missile_count = ms_count
+
+        current_situation_danger = 0.0
+        gnn_recommended_maneuver = "NORMAL"
+
+        if state['missiles']:
+            js_real = {'pos': state['jet']['pos'], 'vel': state['jet']['vel'], 'type': 0}
+            ms_real = [{'pos': m['pos'], 'vel': m['vel'], 'type': 1} for m in state['missiles']]
+            fs_real = [{'pos': f['pos'], 'vel': f['vel'], 'type': 2} for f in state['flares']]
+            sgs_real = build_candidate_sub_graphs(js_real, ms_real, fs_real)
+            if sgs_real:
+                ctxs_real = torch.stack([g.context for g in sgs_real]).to(device)
+                with torch.no_grad():
+                    d_real, _, gru_hidden, m_logits = model(sgs_real, ctxs_real, gru_hidden)
+                current_situation_danger     = d_real.item()
+                gnn_recommended_maneuver     = MANEUVER_NAMES[m_logits.argmax().item()]
+
+        drop_flare = (current_situation_danger > 0.55) and len(state['missiles']) > 0
         if not decision_queue.full():
-            decision_queue.put((best_heading, drop_flare, best_attention, lowest_total))
+            decision_queue.put((best_heading, drop_flare, best_attention,
+                                current_situation_danger, best_edges,
+                                candidate_scores, gnn_recommended_maneuver))
 
 # ═══════════════════════════════════════════════════════════════
 #  4.  CONSTANTS & PYGAME INIT
@@ -220,8 +328,8 @@ class Jet:
         self.x, self.y     = float(x), float(y)
         self.vx, self.vy   = 0.0, 0.0
         self.heading       = 0.0
-        self.speed         = 5.4
-        self.max_speed     = 5.4
+        self.speed         = 5.0
+        self.max_speed     = 5.0
         self.drag          = 0.92
         self.radius        = 11
         self.last_flare_time  = 0
@@ -265,8 +373,8 @@ class JetMissile:
     def __init__(self, x, y, tx, ty):
         self.x, self.y   = float(x), float(y)
         self.heading     = math.atan2(ty-y, tx-x)
-        self.speed       = 6.0
-        self.radius      = 3
+        self.speed       = 4.0
+        self.radius      = 4
         self.spawn_time  = pygame.time.get_ticks()
         self.vx = math.cos(self.heading)*self.speed
         self.vy = math.sin(self.heading)*self.speed
@@ -313,12 +421,14 @@ class HomingMissile:
         self.dead        = False
         self.trail       = deque(maxlen=12)
         self.spawn_delay = 0
+        self.lateral_bias = 0.0   # persistent curve for cluster formation spread
     def update(self):
         if self.spawn_delay>0: self.spawn_delay-=1; return
         dx,dy = self.target.x-self.x, self.target.y-self.y
         dh    = math.atan2(dy,dx)
         diff  = normalize_angle(dh-self.heading)
         self.heading += max(-self.turn_rate, min(self.turn_rate, diff))
+        self.heading += self.lateral_bias  # cluster spread: each missile drifts its own way
         self.vx = math.cos(self.heading)*self.speed
         self.vy = math.sin(self.heading)*self.speed
         self.x += self.vx; self.y += self.vy
@@ -734,6 +844,45 @@ def reset_game():
     launcher_ballistic = Launcher(WIDTH-100, HEIGHT-50, (255,100,255))
     return jet, missiles, ai_missiles, flares, explosions, shockwaves, launcher_homing, launcher_ballistic
 
+def draw_polar_hud(surface, jet_heading, candidate_scores, cx, cy, r=48):
+    """Polar chart of candidate headings — spoke length = safety, color = danger."""
+    if not candidate_scores:
+        return
+    s = pygame.Surface((r*2+20, r*2+20), pygame.SRCALPHA)
+    ox, oy = r+10, r+10
+
+    # Background rings
+    for ring_r in [r//3, r*2//3, r]:
+        pygame.draw.circle(s, (0, 180, 140, 18), (ox, oy), ring_r, 1)
+    pygame.draw.circle(s, (0, 180, 140, 35), (ox, oy), 4)  # center dot
+
+    max_d = max(d for _, d in candidate_scores) + 1e-5
+    min_d = min(d for _, d in candidate_scores)
+
+    for angle, danger in candidate_scores:
+        norm = (danger - min_d) / (max_d - min_d + 1e-5)
+        spoke_len = int((1.0 - norm) * r)  # safe = long spoke
+        # Screen angle: subtract pi/2 because pygame y-axis is flipped
+        screen_angle = angle - math.pi / 2
+        ex = int(ox + math.cos(screen_angle) * spoke_len)
+        ey = int(oy + math.sin(screen_angle) * spoke_len)
+        col_r = int(norm * 255)
+        col_g = int((1.0 - norm) * 200)
+        alpha = 160 + int(norm * 80)
+        width = 2 if danger == min_d else 1
+        pygame.draw.line(s, (col_r, col_g, 40, alpha), (ox, oy), (ex, ey), width)
+        # Dot at tip
+        pygame.draw.circle(s, (col_r, col_g, 40, alpha), (ex, ey), 2)
+
+    # Chosen heading arrow (bright teal)
+    ba = jet_heading - math.pi / 2
+    bx = int(ox + math.cos(ba) * r)
+    by = int(oy + math.sin(ba) * r)
+    pygame.draw.line(s, (0, 255, 200, 230), (ox, oy), (bx, by), 2)
+    pygame.draw.circle(s, (0, 255, 200, 230), (bx, by), 3)
+
+    surface.blit(s, (cx - ox, cy - oy))
+
 def run_game():
     jet, missiles, ai_missiles, flares, explosions, shockwaves, lh, lb = reset_game()
     glow_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -750,6 +899,9 @@ def run_game():
     radar_angle = 0.0
     current_hud_attention = []
     current_hud_danger    = 0.0
+    current_candidate_scores = []
+    current_edges = []
+    show_gnn_overlay = False
 
     # FSM state
     ai_maneuver    = "NORMAL"
@@ -760,6 +912,7 @@ def run_game():
     maneuver_memory  = {}
     global_gnn_heading = 0.0
     global_gnn_flare   = False
+    gnn_recommended_maneuver = "NORMAL"
 
     # Stats tracking
     stats = {'fired': 0, 'flares': 0, 'maneuvers': 0}
@@ -771,6 +924,30 @@ def run_game():
             flares.append(FlareParticle(jet.x, jet.y, angle, jet.speed + speed_boost))
         stats['flares'] += n
 
+    def predict_intercept_flare(m):
+        """
+        Computes angle+speed to throw a flare into a missile's predicted path.
+        Uses time-of-closest-approach math — flare arrives at the same point
+        the missile will be at, making the missile lock onto the flare instead.
+        """
+        dx  = m.x  - jet.x
+        dy  = m.y  - jet.y
+        rvx = m.vx - jet.vx   # missile vel relative to jet
+        rvy = m.vy - jet.vy
+        rel_spd_sq = rvx*rvx + rvy*rvy + 1e-5
+        # Time of closest approach (when missile is nearest to jet's current pos)
+        t = -(dx*rvx + dy*rvy) / rel_spd_sq
+        t = max(5.0, min(50.0, t))   # clamp 5–50 frames
+        # Predicted missile world position at time t
+        target_x = m.x + m.vx * t
+        target_y = m.y + m.vy * t
+        # Angle and speed from jet to that prediction
+        angle = math.atan2(target_y - jet.y, target_x - jet.x)
+        dist  = math.hypot(target_x - jet.x, target_y - jet.y)
+        # 1.4x boost so flare beats the missile to the intercept point
+        speed = min(max(dist / t * 1.4, 5.0), 14.0)
+        return angle, speed
+    
     running = True
     while running:
         frame_count += 1
@@ -790,40 +967,48 @@ def run_game():
                         lb.fire()
                         missiles.append(BallisticMissile(lb.x, lb.y, jet.x, jet.y))
                         stats['fired'] += 1
-                    # ── CLUSTER: only fires if launcher alive ──────────────
                     elif event.key == pygame.K_c and cluster_cooldown == 0 and lh.alive:
                         cluster_cooldown = 360
                         base_a = math.atan2(jet.y-lh.y, jet.x-lh.x)
-                        offsets    = [-20,-10,0,10,20]
-                        speeds     = [3.5,3.7,3.9,4.1,4.3]
-                        turn_rates = [0.06,0.05,0.04,0.03,0.025]
-                        for i,(off,spd,tr) in enumerate(zip(offsets,speeds,turn_rates)):
-                            ra = math.radians(off)
+                        offsets      = [-20, -10,  0,  10,  20]
+                        speeds       = [3.5, 3.7, 3.9, 4.1, 4.3]
+                        turn_rates   = [0.06, 0.05, 0.04, 0.03, 0.025]
+                        # Each missile gets a gentle persistent curve to hold formation spread
+                        lat_biases   = [-0.014, -0.007, 0.0, 0.007, 0.014]
+                        for i,(off,spd,tr,lb_val) in enumerate(zip(offsets,speeds,turn_rates,lat_biases)):
+                            ra  = math.radians(off)
                             tx2 = lh.x + math.cos(base_a+ra)*120
                             ty2 = lh.y + math.sin(base_a+ra)*120
-                            m = HomingMissile(lh.x, lh.y, jet, tx2, ty2)
-                            m.speed=spd; m.max_speed=spd; m.turn_rate=tr; m.spawn_delay=i*3
+                            m   = HomingMissile(lh.x, lh.y, jet, tx2, ty2)
+                            m.speed = spd; m.max_speed = spd
+                            m.turn_rate = tr; m.spawn_delay = i*3
+                            m.lateral_bias = lb_val
                             missiles.append(m)
                         stats['fired'] += 5
                     elif event.key == pygame.K_ESCAPE:
                         state_queue.put(None)
                         return "menu"
+                    elif event.key == pygame.K_g:
+                        show_gnn_overlay = not show_gnn_overlay
 
         if not game_over:
             # ── Push state to GNN every 6 frames ──────────────────────
             if frame_count % 6 == 0 and state_queue.empty():
                 state_queue.put({
                     'jet':     {'pos':[jet.x,jet.y],'vel':[jet.vx,jet.vy],'heading':jet.heading},
-                    'missiles':[{'pos':[m.x,m.y],'vel':[m.vx,m.vy]} for m in missiles],
+                    'missiles':[{'pos':[m.x,m.y],'vel':[m.vx,m.vy],'type':getattr(m,'mtype',0)} for m in missiles],
                     'flares':  [{'pos':[f.x,f.y],'vel':[f.vx,f.vy]} for f in flares]
                 })
 
             if not decision_queue.empty():
-                global_gnn_heading, global_gnn_flare, current_hud_attention, current_hud_danger = decision_queue.get()
+                (global_gnn_heading, global_gnn_flare, current_hud_attention,
+                current_hud_danger, current_edges, current_candidate_scores,
+                gnn_recommended_maneuver) = decision_queue.get()
 
             # ── Cooldown ticks ─────────────────────────────────────────
             if cobra_cooldown   > 0: cobra_cooldown   -= 1
             if general_cooldown > 0: general_cooldown -= 1
+            # general_cooldown removed — let the AI re-enter maneuvers immediately
 
             # ── Wall proximity ─────────────────────────────────────────
             d_left  = jet.x
@@ -864,7 +1049,7 @@ def run_game():
             # ── FSM TRANSITIONS ────────────────────────────────────────
             #  Priority: IMMELMANN > COBRA > FALLING_LEAF > JINKING > BARREL_ROLL
 
-            # 1. IMMELMANN — wall escape, always overrides
+            # 1. IMMELMANN — wall escape, always overrides everything
             if htw and ai_maneuver != "IMMELMANN":
                 ai_maneuver    = "IMMELMANN"
                 maneuver_timer = 35
@@ -872,91 +1057,129 @@ def run_game():
                 stats['maneuvers'] += 1
 
             elif ai_maneuver == "NORMAL" and general_cooldown == 0:
+                near = [(m, math.hypot(m.x-jet.x, m.y-jet.y)) for m in missiles]
+                rec  = gnn_recommended_maneuver   # GNN already computed this
 
-                # 2. COBRA — head-on single missile (GNN danger > 0.55 OR physically very close)
-                cobra_gnn_ok = current_hud_danger > 0.55
-                cobra_dist_ok= (len(close_80) == 1 and head_on)
-                if (cobra_gnn_ok or cobra_dist_ok) and cobra_cooldown == 0 and wx > 150 and wy > 150:
-                    ai_maneuver    = "COBRA"
-                    maneuver_timer = 40
-                    cobra_cooldown = 480
-                    maneuver_memory['start_speed'] = jet.speed
+                if rec == "COBRA" and cobra_cooldown == 0 and wx > 140 and wy > 140:
+                    # Confirm head-on before committing to COBRA
+                    close80 = [m for m,d in near if d < 100]
+                    if close80:
+                        ai_maneuver = "COBRA"; maneuver_timer = 40
+                        cobra_cooldown = 360; maneuver_memory['start_speed'] = jet.speed
+                        stats['maneuvers'] += 1
+
+                elif rec == "FALLING_LEAF" and wx > 100 and wy > 100 and len(missiles) >= 1:
+                    ai_maneuver = "FALLING_LEAF"; maneuver_timer = 90
                     stats['maneuvers'] += 1
 
-                # 3. FALLING LEAF — 2+ missiles close (GNN > 0.50 OR physically overwhelmed)
-                elif (current_hud_danger > 0.50 or len(close_150) >= 2) \
-                        and len(missiles) >= 2 and wx > 120 and wy > 120:
-                    ai_maneuver    = "FALLING_LEAF"
-                    maneuver_timer = 90
+                elif rec == "JINKING" and wx > 80 and wy > 80 and len(missiles) >= 1:
+                    ai_maneuver = "JINKING"; maneuver_timer = 120
                     stats['maneuvers'] += 1
 
-                # 4. JINKING — multiple missiles (GNN > 0.40 OR 3+ total missiles)
-                elif (current_hud_danger > 0.40 or len(missiles) >= 3) \
-                        and len(missiles) >= 2 and wx > 100 and wy > 100:
-                    ai_maneuver    = "JINKING"
-                    maneuver_timer = 120
+                elif rec == "BARREL_ROLL" and wx > 150 and wy > 150 and len(missiles) == 1:
+                    ai_maneuver = "BARREL_ROLL"; maneuver_timer = 72
                     stats['maneuvers'] += 1
 
-                # 5. BARREL ROLL — single missile within 200px (GNN > 0.40 OR physically present)
-                elif (current_hud_danger > 0.40 or len(close_200) == 1) \
-                        and len(missiles) == 1 and wx > 150 and wy > 150:
-                    ai_maneuver    = "BARREL_ROLL"
-                    maneuver_timer = 72
-                    stats['maneuvers'] += 1
+                # Geometry safety net: if GNN says NORMAL but a missile is <80px, force COBRA
+                elif rec == "NORMAL" and cobra_cooldown == 0 and wx > 140 and wy > 140:
+                    close80 = [m for m,d in near if d < 80]
+                    if close80:
+                        ai_maneuver = "COBRA"; maneuver_timer = 40
+                        cobra_cooldown = 360; maneuver_memory['start_speed'] = jet.speed
+                        stats['maneuvers'] += 1
 
             # ── MANEUVER EXECUTION ─────────────────────────────────────
             if ai_maneuver == "IMMELMANN":
-                jet.speed = jet.max_speed * 1.3
+                jet.speed = jet.max_speed * 1.5
                 diff = normalize_angle(weh - jet.heading)
                 jet.heading += diff * 0.12
                 maneuver_timer -= 1
                 if maneuver_timer <= 0:
                     jet.heading  = heading_to_center()
                     ai_maneuver  = "NORMAL"
-                    general_cooldown = 45
 
             elif ai_maneuver == "COBRA":
                 if maneuver_timer > 20:
-                    jet.speed = max(0.1, jet.speed - maneuver_memory['start_speed']/20)
-                    jet.heading += math.pi / 20
+                    # Phase 1: hard decelerate + pitch perpendicular to missile approach
+                    jet.speed = max(0.3, jet.speed - maneuver_memory['start_speed'] / 20)
+                    if missiles:
+                        tm = min(missiles, key=lambda m: math.hypot(m.x-jet.x, m.y-jet.y))
+                        # Two perpendicular options to missile velocity vector
+                        perp1 = math.atan2(-tm.vx, tm.vy)
+                        perp2 = math.atan2(tm.vx, -tm.vy)
+                        # Pick the one that moves the jet farther from the missile
+                        d1 = math.hypot(jet.x+math.cos(perp1)*8 - tm.x,
+                                        jet.y+math.sin(perp1)*8 - tm.y)
+                        d2 = math.hypot(jet.x+math.cos(perp2)*8 - tm.x,
+                                        jet.y+math.sin(perp2)*8 - tm.y)
+                        target_h = perp1 if d1 > d2 else perp2
+                        diff = normalize_angle(target_h - jet.heading)
+                        jet.heading += diff * 0.22   # fast pitch to perpendicular
                 elif maneuver_timer == 20:
-                    # 14-particle full ring flare wall
-                    for i in range(14):
-                        spawn_flares(1, i*(2*math.pi/14), 0, 5.0)
+                    # Phase 2: peak decel — deploy full ring of intercept flares
+                    for miss in missiles:
+                        angle, speed = predict_intercept_flare(miss)
+                        for spread in [-0.25, 0.0, 0.25]:
+                            flares.append(FlareParticle(jet.x, jet.y, angle+spread,
+                                                        speed * (1.0 - abs(spread)*0.2)))
+                            stats['flares'] += 1
+                    # 360° emergency ring too
+                    for i in range(8):
+                        flares.append(FlareParticle(jet.x, jet.y,
+                                                    i*(2*math.pi/8), 5.0))
+                        stats['flares'] += 1
                 else:
-                    jet.speed = min(jet.max_speed*1.2, jet.speed + jet.max_speed*1.2/20)
+                    # Phase 3: re-accelerate, flee direction away from missile
+                    if missiles:
+                        tm = min(missiles, key=lambda m: math.hypot(m.x-jet.x, m.y-jet.y))
+                        flee_h = math.atan2(jet.y-tm.y, jet.x-tm.x)
+                        diff   = normalize_angle(flee_h - jet.heading)
+                        jet.heading += diff * 0.25
+                    jet.speed = min(jet.max_speed*1.4,
+                                   jet.speed + jet.max_speed*1.4/20)
                 maneuver_timer -= 1
                 if maneuver_timer <= 0:
-                    ai_maneuver = "NORMAL"; general_cooldown = 60
+                    ai_maneuver  = "NORMAL"
+                    general_cooldown = 60
 
             elif ai_maneuver == "FALLING_LEAF":
-                jet.speed = jet.max_speed * 0.2
+                jet.speed = jet.max_speed * 0.35
                 fc = 90 - maneuver_timer
-                jet.heading += math.sin(fc*0.4) * 0.6
-                # 6 flares every 18 frames in 180° rear arc
+                jet.heading += math.sin(fc*0.35) * 0.35
+                # 8 flares every 18 frames in 180° rear arc
                 if fc % 18 == 0:
-                    spawn_flares(6, jet.heading+math.pi-math.pi/2, 180, 4.0)
+                    spawn_flares(10, jet.heading+math.pi-math.pi/2, 180, 4.0)
                 maneuver_timer -= 1
                 if maneuver_timer <= 0 or not missiles or current_hud_danger < 0.2:
-                    ai_maneuver = "NORMAL"; general_cooldown = 60
+                    ai_maneuver = "NORMAL"
 
             elif ai_maneuver == "JINKING":
-                jet.speed = jet.max_speed * 0.85
-                # Snap heading randomly every 10 frames
-                if maneuver_timer % 10 == 0:
-                    jd = random.choice([-0.45,-0.3,0.3,0.45])
-                    prop = jet.heading + jd
-                    pvx = math.cos(prop)*jet.speed; pvy = math.sin(prop)*jet.speed
-                    # Wall-safe check
-                    if not (jet.x+pvx*20 < 80 or jet.x+pvx*20 > 720 or
+                jet.speed = jet.max_speed * 0.51
+                if maneuver_timer % 10 == 0 and missiles:
+                    # Zigzag PERPENDICULAR to nearest missile — not random
+                    nm   = min(missiles, key=lambda m: math.hypot(m.x-jet.x, m.y-jet.y))
+                    m_angle = math.atan2(nm.vy, nm.vx)
+                    # Alternate left/right perpendicular each jink
+                    side = 1 if (maneuver_timer // 10) % 2 == 0 else -1
+                    prop = m_angle + side * math.pi / 2
+                    pvx  = math.cos(prop) * jet.speed
+                    pvy  = math.sin(prop) * jet.speed
+                    # Wall safety — try other side if this one leads to wall
+                    if (jet.x+pvx*20 < 80 or jet.x+pvx*20 > 720 or
                             jet.y+pvy*20 < 80 or jet.y+pvy*20 > 470):
-                        jet.heading = prop
-                # 3 rear flares every 20 frames during jinking
+                        prop = m_angle - side * math.pi / 2
+                    jet.heading = prop
+                # Intercept flares during jinking — aimed at each missile
                 if maneuver_timer % 20 == 0:
-                    spawn_flares(3, jet.heading+math.pi-math.radians(40), 80, 3.5)
+                    for miss in missiles[:3]:   # cap at 3 missiles for perf
+                        angle, speed = predict_intercept_flare(miss)
+                        flares.append(FlareParticle(jet.x, jet.y, angle,       speed))
+                        flares.append(FlareParticle(jet.x, jet.y, angle - 0.2, speed*0.85))
+                        stats['flares'] += 5
                 maneuver_timer -= 1
                 if maneuver_timer <= 0:
-                    ai_maneuver = "NORMAL"; general_cooldown = 60
+                    ai_maneuver  = "NORMAL"
+                    general_cooldown = 45
 
             elif ai_maneuver == "BARREL_ROLL":
                 jet.speed = jet.max_speed
@@ -964,33 +1187,61 @@ def run_game():
                     jet.heading += 0.15
                 else:
                     jet.heading = heading_to_center()
-                    ai_maneuver = "NORMAL"; general_cooldown = 60
+                    ai_maneuver = "NORMAL"
                 # 2 side flares every 24 frames during roll
                 if maneuver_timer % 24 == 0:
-                    spawn_flares(2, jet.heading+math.pi/2-math.radians(20), 40, 4.0)
+                    spawn_flares(6, jet.heading+math.pi/2-math.radians(20), 40, 4.0)
                 maneuver_timer -= 1
                 if maneuver_timer <= 0:
-                    ai_maneuver = "NORMAL"; general_cooldown = 90
+                    ai_maneuver = "NORMAL"
 
             elif ai_maneuver == "NORMAL":
                 jet.speed = jet.max_speed
-                if global_gnn_heading != 0.0:
-                    jet.heading = global_gnn_heading
-                # GNN-triggered flare deploy (standard mode)
-                if (global_gnn_flare
-                        and pygame.time.get_ticks()-jet.last_flare_time > 2500
+
+                if missiles:
+                    # Geometric flee: always point away from the nearest missile
+                    nearest_m  = min(missiles, key=lambda m: math.hypot(m.x-jet.x, m.y-jet.y))
+                    nearest_d  = math.hypot(nearest_m.x-jet.x, nearest_m.y-jet.y)
+                    flee_h     = math.atan2(jet.y - nearest_m.y, jet.x - nearest_m.x)
+
+                    if global_gnn_heading != 0.0:
+                        # Blend: flee dominates when missile is close (<150 px), GNN wins when far
+                        flee_w = max(0.0, min(1.0, (200.0 - nearest_d) / 200.0)) ** 1.5
+                        gnn_w  = 1.0 - flee_w
+                        diff_gnn  = normalize_angle(global_gnn_heading - jet.heading)
+                        diff_flee = normalize_angle(flee_h - jet.heading)
+                        combined  = diff_gnn * gnn_w + diff_flee * flee_w
+                    else:
+                        combined = normalize_angle(flee_h - jet.heading)
+
+                    # Smooth steer — never snap, let physics carry momentum
+                    jet.heading += combined * 0.18
+
+                elif global_gnn_heading != 0.0:
+                    diff = normalize_angle(global_gnn_heading - jet.heading)
+                    jet.heading += diff * 0.18
+
+                # Intercept-aimed flares — throw toward missile's predicted position
+                if (global_gnn_flare and missiles
+                        and pygame.time.get_ticks()-jet.last_flare_time > 2000
                         and wx > 80 and wy > 80):
                     jet.last_flare_time = pygame.time.get_ticks()
-                    spawn_flares(8, jet.heading+math.radians(45), 270, jet.speed+2.0)
+                    for miss in missiles:
+                        angle, speed = predict_intercept_flare(miss)
+                        flares.append(FlareParticle(jet.x, jet.y, angle,        speed))
+                        flares.append(FlareParticle(jet.x, jet.y, angle - 0.20, speed*0.85))
+                        flares.append(FlareParticle(jet.x, jet.y, angle + 0.20, speed*0.85))
+                        stats['flares'] += 3
                     global_gnn_flare = False
 
-            # ── JET COUNTER-ATTACK ────────────────────────────────────
+            # ── JET COUNTER-ATTACK (every 4 s, targets nearest alive launcher) ──
             if pygame.time.get_ticks()-jet.last_attack_time > 4000:
-                targets = [l for l in [lh,lb] if l.alive]
+                targets = [l for l in [lh, lb] if l.alive]
                 if targets:
-                    tgt = random.choice(targets)
+                    # Prefer the launcher that is closer so the missile is harder to dodge
+                    tgt = min(targets, key=lambda l: math.hypot(l.x-jet.x, l.y-jet.y))
                     ai_missiles.append(JetMissile(jet.x, jet.y, tgt.x, tgt.y))
-                    jet.last_attack_time = pygame.time.get_ticks()
+                jet.last_attack_time = pygame.time.get_ticks()  # always reset so timer stays rhythmic
 
             # ── PHYSICS UPDATE ────────────────────────────────────────
             jet.update()
@@ -1064,6 +1315,23 @@ def run_game():
                 if not m.is_dead(): alive_m.append(m)
             missiles = alive_m
 
+            # ── CLUSTER MISSILE REPULSION ─────────────────────────────
+            # Homing missiles push each other apart so they never merge/overlap
+            REPULSE_DIST  = 26
+            REPULSE_FORCE = 0.20
+            homing = [m for m in missiles if isinstance(m, HomingMissile) and not m.dead]
+            for i in range(len(homing)):
+                for j in range(i+1, len(homing)):
+                    m1, m2 = homing[i], homing[j]
+                    dx = m2.x - m1.x; dy = m2.y - m1.y
+                    d  = math.hypot(dx, dy)
+                    if 0 < d < REPULSE_DIST:
+                        strength = (REPULSE_DIST - d) / REPULSE_DIST * REPULSE_FORCE
+                        away = math.atan2(dy, dx)   # m1→m2 direction
+                        # m1 turns away, m2 turns away in opposite direction
+                        m1.heading = normalize_angle(m1.heading - strength * math.pi * (1 - d/REPULSE_DIST))
+                        m2.heading = normalize_angle(m2.heading + strength * math.pi * (1 - d/REPULSE_DIST))
+
             # AI win: both launchers dead
             if not lh.alive and not lb.alive:
                 game_over=True; user_won=False; game_over_time=pygame.time.get_ticks()
@@ -1086,6 +1354,23 @@ def run_game():
             s.update(); s.draw(glow_surface)
         shockwaves[:] = [s for s in shockwaves if not s.is_dead()]
         screen.blit(glow_surface, (0,0))
+
+        if show_gnn_overlay and current_edges:
+            mags = [e['mag'] for e in current_edges]
+            max_mag = max(mags) + 1e-5
+            gnn_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            for e in current_edges:
+                norm = e['mag'] / max_mag
+                alpha = int(30 + norm * 180)
+                width = max(1, int(norm * 3))
+                r = int(norm * 255)
+                g = int((1 - norm) * 180)
+                x1, y1 = int(e['p1'][0]), int(e['p1'][1])
+                x2, y2 = int(e['p2'][0]), int(e['p2'][1])
+                pygame.draw.line(gnn_surf, (r, g, 50, alpha), (x1, y1), (x2, y2), width)
+            screen.blit(gnn_surf, (0, 0))
+            lbl = font_sm.render("GNN GRAPH [G]", True, (0, 200, 160))
+            screen.blit(lbl, (14, HEIGHT - 95))
 
         # ── HUD bar ───────────────────────────────────────────────────
         hy = HEIGHT-50
@@ -1136,6 +1421,12 @@ def run_game():
                 screen.blit(font_tiny.render(f"{int(wv*100)}%",True,(80,140,120)),(bx2-1,bby-bh2-14))
         else:
             screen.blit(font_sm.render("no threats",True,(40,80,70)),(px2+45,py2+65))
+
+        # Polar counterfactual heading chart — top-left floating panel
+        polar_cx, polar_cy = 60, 65
+        draw_polar_hud(screen, jet.heading, current_candidate_scores, polar_cx, polar_cy, r=44)
+        lbl_p = font_tiny.render("HEADING RISK", True, (0, 160, 120))
+        screen.blit(lbl_p, (polar_cx - lbl_p.get_width()//2, polar_cy + 50))
 
         # Game over flash
         if game_over:
