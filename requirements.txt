@@ -1,4 +1,4 @@
-# ── NEURAL EVASION — Requirements ────────────────────────────────────────────
+# NEURAL EVASION — Requirements 
 # Python 3.10 – 3.12 recommended
 #
 # INSTALLATION ORDER MATTERS for PyTorch Geometric.
@@ -20,7 +20,7 @@
 # Step 3 — Everything else:
 #   pip install -r requirements.txt
 #
-# ─────────────────────────────────────────────────────────────────────────────
+# #########################################################################
 
 # Game runtime
 pygame>=2.1.0
