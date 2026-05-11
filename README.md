@@ -190,7 +190,7 @@ Full architectural upgrade. Replaces the stateless attention module with a GRU-b
 
 ---
 
-## Known Limitations
+## Future Works
 
 - **FSM–GNN gap:** The GNN maneuver head recommends FALLING_LEAF (≥2 missiles within 150 px) more often than the FSM executes it — the geometry gate is stricter than the model's learned intuition. End-to-end policy gradient training is the natural fix.
 - **2D only:** The simulator and game engine are 2D. Missile homing uses proportional navigation in the screen plane only.
