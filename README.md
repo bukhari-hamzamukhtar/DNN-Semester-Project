@@ -24,6 +24,7 @@ neural-evasion/
 │
 ├── paper/
 │   └── report.pdf                  # IEEE conference paper
+│   └── architecture.pdf            # visual flowchart
 │
 ├── requirements.txt
 └── README.md
